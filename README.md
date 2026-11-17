@@ -1,0 +1,352 @@
+# reljoin — closed-loop queries without the two-way blow-up
+
+`reljoin` answers cyclic (closed-loop) conjunctive queries over bag relations
+using **layered ordered index seeks**. It never materialises a two-relation
+intermediate, never hands the multi-table join to SQL, and streams results in
+global lexicographic order.
+
+The motivating situation: `A(x,y)`, `B(y,z)`, `C(z,x)`. Computing `A ⋈ B`
+first creates a huge intermediate set that `C` then almost entirely discards.
+`reljoin` instead walks one variable at a time, and at each layer keeps only
+the values on which **every** relation that mentions the current variable
+agrees.
+
+```
+$ reljoin run --decl query.json --index idx
+[1,2,3,24]      # x=1, y=2, z=3, bag multiplicity 24
+```
+
+---
+
+## Quick start (from an empty directory)
+
+```bash
+git clone <this repo> reljoin && cd reljoin      # or copy the tree
+mkdir -p demo/data
+
+cat > demo/query.json <<'JSON'
+{"version": 1,
+ "order": ["x", "y", "z"],
+ "relations": [
+   {"name": "A", "vars": ["x", "y"]},
+   {"name": "B", "vars": ["y", "z"]},
+   {"name": "C", "vars": ["z", "x"]}]}
+JSON
+
+printf '[1,2]\n[1,2]\n'            > demo/data/A.jsonl
+printf '[2,3]\n[2,3]\n[2,3]\n'     > demo/data/B.jsonl
+printf '[3,1]\n[3,1]\n[3,1]\n[3,1]\n' > demo/data/C.jsonl
+
+python3 -m reljoin prepare --decl demo/query.json --data demo/data \
+                           --index demo/idx --memory 32M
+python3 -m reljoin explain --decl demo/query.json --index demo/idx
+python3 -m reljoin run     --decl demo/query.json --index demo/idx
+```
+
+Output:
+
+```
+[1,2,3,24]
+```
+
+Removing `C.jsonl`'s rows (or deleting the relation from the declaration) makes
+the result **empty**, and the process still exits 0 — an empty result is a
+successful query.
+
+The full end-to-end reproduction, including the oracle, the hotspot and the
+large-output observations, is:
+
+```bash
+python3 tests/reproduce.py --workdir /tmp/reljoin-demo
+```
+
+It generates all data with `tests/gen_data.py`; no large data is stored in the
+repository.
+
+---
+
+## Commands
+
+### `prepare`
+
+Reads `<relation>.jsonl` for every relation named in the declaration and
+writes a read-only index directory.
+
+```
+python3 -m reljoin prepare --decl query.json --data data/ --index idx/ --memory 64M
+```
+
+* `--memory SIZE` is required (`32M`, `512M`, `1G`, or plain bytes). It bounds
+  the external-sort buffer; input that does not fit spills to
+  `--sort-dir` (default: system temp) and is merged in multiple passes, so
+  build memory is bounded independently of input size.
+* `--index` is published **atomically**: everything is built in a hidden
+  staging directory next to it, fsynced, then renamed. If anything fails
+  (missing file, malformed line, out-of-range integer, Ctrl-C), the staging
+  directory is removed and no index appears. A pre-existing index is only
+  replaced with `--force`, and even then it stays intact if the rebuild fails.
+* Duplicate rows are aggregated at build time into the 16-byte multiplicity
+  column `m`, so the index is deduplicated and exact.
+* Progress and a summary go to stderr; `--json` prints the manifest.
+
+The declaration's **column order** defines each relation's JSON layout. The
+index primary key is those columns **projected onto the global variable
+order**, so every prefix of the global order is an index prefix. Reordering
+columns in the declaration is therefore never confused with reordering the
+JSON array, and a file whose arity disagrees with the declaration is a hard
+error rather than a silent mis-join. The file's SHA-256, record count and key
+mapping are recorded in `manifest.json`.
+
+### `explain`
+
+Prints, without running the query:
+
+* the global variable order and what it means (both the solving order and the
+  emission order);
+* each atom (relation occurrence / alias), its bytes-per-column layout, the
+  index table that serves it, its **access order** (key columns in global
+  order), and how many source rows were collapsed into each multiplicity;
+* every layer: which atoms are **active** (mention the variable), which are
+  **completing** (their key becomes fully bound there), the bound key prefix
+  each atom seeks on, and where its multiplicity factor comes from;
+* an explicit statement that no SQL join and no two-relation intermediate is
+  used.
+
+`--json` emits the same document machine-readably.
+
+### `run`
+
+```
+python3 -m reljoin run --decl query.json --index idx/ \
+    [--out FILE] [--limit N] [--max-output-bytes N] \
+    [--stats FILE] [--memory SIZE]
+```
+
+Emits one line per complete binding:
+
+```
+[<v0>,<v1>,...,<vk-1>,<multiplicity>]
+```
+
+in ascending lexicographic order of the global variable order. Each distinct
+binding appears exactly once with its **exact positive integer** multiplicity:
+the product of the multiplicities of the corresponding tuple in every atom
+(aliases contribute independently). Multiplicities are Python arbitrary
+precision integers — a product of many 16-byte factors cannot wrap at 2⁶⁴.
+
+Exit codes are a contract:
+
+| code | meaning |
+|------|---------|
+| 0 | enumeration completed (including an empty result) |
+| 2 | usage error |
+| 3 | declaration problem |
+| 4 | source-data problem |
+| 5 | index missing / never completed |
+| 6 | index damaged, truncated or from another declaration |
+| 7 | **run incomplete** (consumer closed, cancelled, write failed, `--limit` or `--max-output-bytes` reached) |
+| 8 | resource error |
+
+`--stats FILE` writes exact counters (never estimates):
+
+```json
+{"status": "complete",
+ "index_lookups": 9914,
+ "index_seeks_first": 3004, "index_seeks_ge": 2348, "index_seeks_gt": 3032,
+ "point_probes": 1530,
+ "candidate_values": [1, 1500, 15], "candidate_values_total": 1516,
+ "candidates_accepted": 633, "candidates_rejected": 0,
+ "complete_bindings": 15, "emitted": 15,
+ "max_live_atoms": 2, "peak_rss_kib": 19620,
+ "peak_prefix_len": 3, "elapsed_seconds": 0.051, ...}
+```
+
+`peak_rss_kib` is the process's real peak resident set. `index_lookups` is the
+actual number of cursor executions, split into first-value reads,
+`>=` seeks, `>` seeks and exact-key probes. `candidate_values` counts the
+values produced by the layer's intersection, i.e. how many values actually got
+pushed down.
+
+---
+
+## Python interface
+
+```python
+import reljoin
+
+decl = reljoin.load_declaration("query.json")
+idx  = reljoin.open_index("idx", expected_declaration=decl)   # verifies tables
+q    = reljoin.query(idx, decl, memory_bytes=16 << 20)
+
+try:
+    for values, multiplicity in q:      # (tuple, int)
+        ...                             # values in global order
+finally:
+    q.close()                           # releases cursors; marks incomplete if
+                                        # the loop did not exhaust
+print(q.report())                       # exact statistics
+```
+
+`reljoin.query(...)` also works without the declaration (the index carries
+one), and `reljoin.query_bindings(...)` yields `Binding(values, multiplicity)`
+objects. Closing early is safe and truthful: the run is reported as
+`incomplete`, never as a completed empty result.
+
+`reljoin.explain(decl, idx)` returns the structured explain document;
+`reljoin.render_explain(doc)` renders the text form.
+
+---
+
+## How the solver works
+
+Layers are the global variable order, `0 … m-1`.
+
+* **Active atom** at layer `L`: an atom whose variable set contains the
+  variable of `L`.
+* **Completing atom** at layer `L`: an atom whose largest key level is `L`
+  (after binding `L`, its entire key is known).
+
+At layer `L`, each active atom exposes an ascending stream of distinct values
+of the layer variable, restricted to rows matching the already-bound key
+prefix. That stream is read with index seeks:
+
+```sql
+SELECT c_k FROM t
+WHERE c_0=? AND … AND c_{k-1}=?           -- bound prefix
+  AND c_k > ?                             -- or >= for leapfrog
+ORDER BY c_0,…,c_n LIMIT 1                -- an index range seek
+```
+
+The solver intersects those streams by **leapfrog**: take the maximum current
+value, seek every lagging atom to `>= that`, repeat. Only when all streams
+agree is the value pushed down to the next layer. An atom with millions of
+rows but few distinct values at a layer therefore costs a few seeks, not one
+step per row. At the level where an atom completes, its key is fully bound and
+a point lookup returns its bag count; that count multiplies into the running
+product.
+
+Bound state per recursion level: the current prefix (fixed depth), one
+ascending stream per active atom (a cursor plus one value), and the current
+output binding. There is **no per-layer value set**, no list of rows, and no
+materialised join — independent of fan-out. Output is a generator: the
+consumer receives bindings as they are found, so a result with millions of
+rows runs in flat memory.
+
+### Why there is no two-way intermediate
+
+There is never a moment where two relations are joined into a new intermediate
+relation. The only state carried between layers is the current binding prefix;
+each atom is consulted incrementally through its own index. The run
+statistics demonstrate this: in the hotspot scenario below, `|A|·|B| =
+9 000 000`, yet the run performs 9 914 index lookups and produces
+1 516 candidate values.
+
+### Correctness sketch
+
+Every complete binding has, for each atom, a tuple matching it in every
+column. At layer `L` that tuple witnesses membership of the binding's value in
+the atom's stream, so the value survives the intersection; by induction every
+complete binding is reached exactly once. Conversely, a value is pushed down
+at `L` only if every atom mentioning `L` has a matching row under the current
+prefix; completing atoms are additionally point-probed. Ascending streams and
+ascending recursion over the global order make emission lexicographic.
+Scanner output is verified in the tests against an independent Cartesian
+oracle.
+
+### Multiplicity
+
+`m` is stored as a 16-byte big-endian unsigned integer (so a single tuple may
+occur up to 2¹²⁸−1 times; the builder refuses to go beyond). Counts are
+converted to Python ints on read and multiplied in Python. Nothing is ever
+added or multiplied inside SQLite's 64-bit integer arithmetic. A single
+duplicate group above 2⁶⁴ is tested (multiplicity 1000⁹ ≈ 10²⁷).
+
+---
+
+## Verification
+
+```
+python3 -m unittest discover -s tests -v
+```
+
+| test file | what it proves |
+|---|---|
+| `tests/test_oracle_acceptance.py` | results and multiplicities equal an independent Cartesian-enumeration oracle (`tests/oracle.py`), which reads only raw JSONL and never touches the index, SQLite, or the solver |
+| `tests/test_lifecycle.py` | missing vs. damaged index; truncation, bit-flip, stray WAL; atomic build, failed rebuild keeping old index; cancellation, early close, write failure all reported as incomplete; declaration validation |
+| `tests/test_query_plans.py` | every SQL statement the atom executors issue is an index seek on the primary key (no scans, no temp B-trees) |
+| `tests/test_anti_explosion.py` | hotspot and large-output scenarios: candidate counts and index lookups far below the two-way join size; flat peak RSS; real statistics reported |
+
+### The oracle
+
+`tests/oracle.py` enumerates `A × B × C`, keeps assignments that agree on
+shared variables, and counts bags — the most literal possible definition of
+the query. It is deliberately exponential and is used only on small cases.
+Acceptance covers: the hand triangle (`24`), removal of the closing relation
+(empty), self-aliases with permuted columns, a self-join of one relation in
+both directions, shuffled global/decaration orders, empty relations, `int64`
+extremes including `-2⁶³` and `2⁶³−1`, many repeated aliases exceeding 64-bit
+totals, 4-cycles, chorded 4-cycles, and random instances.
+
+### Observations from the generated scenarios
+
+Generate and reproduce (all data generated, none committed):
+
+```bash
+python3 tests/reproduce.py --workdir /tmp/reljoin-demo
+```
+
+**Hotspot** (`gen_data.py --scenario hotspot`, 1 hot `x`, 1 500 `y`, 1 200
+`z`, closure 4):
+
+```
+status: complete, 15 bindings
+candidate_values: [1, 1500, 15]        (x, y, z layers)
+index_lookups: 9914                     (vs |A|·|B| = 2 250 000 combos)
+max_live_atoms: 2,  peak_rss_kib ≈ 19 300
+```
+
+**Large output** (`gen_data.py --scenario bigout`, 20 000 bindings):
+
+```
+status: complete, 20 000 bindings, all emitted
+index_lookups: 280 001, candidate_values: [20000, 20000, 20000]
+peak_rss_kib ≈ 20 000 in a 4 MiB budget
+```
+
+Peak RSS stays essentially constant as the number of emitted bindings grows,
+because nothing is collected before emission.
+
+**Missing vs. damaged** (same script):
+
+```
+$ reljoin run --index does-not-exist   → exit 5, "index-missing: … run 'prepare' first"
+$ reljoin run --index damaged-copy     → exit 6, "index-corrupt: … fails its SHA-256 check"
+```
+
+---
+
+## Design notes and limits
+
+* **Index layout.** One SQLite `WITHOUT ROWID` table per distinct atom
+  (relation plus variable assignment), key columns are the atom's columns in
+  global-order level order, and `m BLOB NOT NULL` holds the multiplicity.
+  Aliases that share a signature share a table; aliases with different
+  column assignments get separate tables, so the alias multiplicity is
+  independent. The database is opened `immutable=1, query_only=1` after
+  verification.
+* **Verification** on `run`/`explain`: manifest parse and shape checks, then
+  per file size, SHA-256, and SQLite `quick_check` plus row-count and
+  multiplicity-shape checks, plus rejection of stray `-wal`/`-journal` files.
+  Missing → exit 5, damaged → exit 6. `--no-deep-verify` skips only the SQLite
+  level (size and hash are always checked).
+* **Bounded memory.** Build: external multi-pass merge sort with a buffer
+  derived from `--memory`. Query: fixed-depth prefix, one cursor per atom, one
+  binding at a time. `--limit` and `--max-output-bytes` stop deliberately and
+  report incomplete.
+* **Cancellation.** SIGINT/SIGTERM/SIGHUP during `run` closes cursors and
+  exits 7 with the statistics written.
+* **No online update, no checkpoint/resume** — rebuild with `prepare --force`.
+* **Limits.** At most 256 variables (layers); a single tuple's multiplicity
+  must fit in 16 bytes; the declaration must be connected through shared
+  variables (e.g. two variables appearing in separate components would be
+  rejected as unconstrained — the oracle asserts this too).
