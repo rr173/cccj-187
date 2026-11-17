@@ -233,3 +233,227 @@ def _reader(fh: BinaryIO, width: int) -> Iterator[bytes]:
             raise ResourceError("temporary sort run is truncated")
         for i in range(0, len(data), width):
             yield data[i:i + width]
+
+
+class VariableExternalSorter:
+    """External merge sort for ``key`` + variable-width ``payload`` records.
+
+    Identical memory contract to :class:`ExternalSorter` (bounded buffer,
+    multi-pass merge, run files in ``directory``), but the payload may have any
+    length (it is the temporal index's variable-length signed delta blob).
+    Records are framed on disk with a 4-byte length prefix; ordering compares
+    only the fixed-width key part, so equal keys keep a stable stream order.
+    """
+
+    _HDR = 4
+
+    def __init__(self, key_width: int, cache_bytes: int,
+                 directory: Optional[str] = None) -> None:
+        if key_width <= 0:
+            raise ValueError("invalid key width")
+        self.key_width = key_width
+        self.cache_bytes = cache_bytes
+        # Python objects plus the framed bytes; stay deliberately conservative
+        # so the memory budget is really honoured.
+        per_item = key_width + 64
+        self.run_records = max(128, cache_bytes // per_item)
+        per_reader = (key_width + 64) * _READ_RECORDS
+        self.fan_in = max(2, min(32, (cache_bytes // 4) // max(1, per_reader)))
+        self._buf: List[bytes] = []
+        self._runs: List[_Run] = []
+        self._dir = directory
+        self._finished = False
+        self.records_in = 0
+        self.records_out = 0
+        self.runs_written = 0
+        self.merge_passes = 0
+        self.bytes_spilled = 0
+
+    def add(self, key: bytes, payload: bytes = b"") -> None:
+        if self._finished:
+            raise RuntimeError("sorter already finished")
+        if len(key) != self.key_width:
+            raise ValueError("record key width mismatch")
+        self._buf.append(key + payload)
+        self.records_in += 1
+        if len(self._buf) >= self.run_records:
+            self._spill()
+
+    @staticmethod
+    def _frame(rec: bytes) -> bytes:
+        if len(rec) > 0xFFFFFFFF:
+            raise ResourceError("a sort record exceeds 4 GiB")
+        return len(rec).to_bytes(4, "big") + rec
+
+    def _new_run_file(self) -> Tuple[BinaryIO, str]:
+        fd, name = tempfile.mkstemp(prefix="reljoin-vrun-", suffix=".bin",
+                                    dir=self._dir)
+        return os.fdopen(fd, "w+b", buffering=1 << 20), name
+
+    def _spill(self) -> None:
+        if not self._buf:
+            return
+        kw = self.key_width
+        self._buf.sort(key=lambda r: r[:kw])
+        fh, name = self._new_run_file()
+        run = _Run(len(self._buf), fh, name)
+        self._runs.append(run)
+        chunk: List[bytes] = []
+        chunk_bytes = 0
+        limit = max(64, min(self.cache_bytes // 2, 8 << 20))
+        for rec in self._buf:
+            frame = self._frame(rec)
+            chunk.append(frame)
+            chunk_bytes += len(frame)
+            if chunk_bytes >= limit:
+                fh.write(b"".join(chunk))
+                self.bytes_spilled += chunk_bytes
+                chunk.clear()
+                chunk_bytes = 0
+        if chunk:
+            fh.write(b"".join(chunk))
+            self.bytes_spilled += chunk_bytes
+        fh.flush()
+        self.runs_written += 1
+        self._buf = []
+
+    def finish(self) -> Iterator[bytes]:
+        """Yield full records (key + payload) in key order."""
+        if self._finished:
+            raise RuntimeError("sorter already finished")
+        self._finished = True
+        if not self._runs:
+            buf = self._buf
+            self._buf = []
+            buf.sort(key=lambda r: r[:self.key_width])
+            try:
+                for rec in buf:
+                    self.records_out += 1
+                    yield rec
+            finally:
+                buf.clear()
+            return
+        if self._buf:
+            self._spill()
+        try:
+            self._reduce_runs()
+            yield from self._merge_iter(
+                [_vreader(run.fh, self.key_width) for run in self._runs]
+            )
+        finally:
+            self._close_runs()
+            self._unlink_runs()
+
+    def _merge_iter(self, streams: List[Iterator[bytes]]) -> Iterator[bytes]:
+        kw = self.key_width
+        heap: List[Tuple[bytes, int]] = []
+        for idx, stream in enumerate(streams):
+            try:
+                heap.append((next(stream), idx))
+            except StopIteration:
+                pass
+        heapq.heapify(heap)
+        while heap:
+            rec, idx = heap[0]
+            self.records_out += 1
+            yield rec
+            try:
+                nxt = next(streams[idx])
+            except StopIteration:
+                heapq.heappop(heap)
+            else:
+                # Order by key only; payloads of equal keys stay in run order.
+                heapq.heapreplace(heap, (nxt, idx))
+
+    def _reduce_runs(self) -> None:
+        while len(self._runs) > self.fan_in:
+            self.merge_passes += 1
+            group: List[_Run] = []
+            new_runs: List[_Run] = []
+            old = self._runs
+            self._runs = []
+            try:
+                for run in old:
+                    group.append(run)
+                    if len(group) >= self.fan_in:
+                        new_runs.append(self._merge_group(group))
+                        group = []
+                if group:
+                    new_runs.append(self._merge_group(group))
+            finally:
+                for run in old:
+                    self._close_run(run)
+                self._runs = new_runs
+                self._unlink_dead(old)
+
+    def _merge_group(self, group: List[_Run]) -> _Run:
+        out, name = self._new_run_file()
+        count = sum(r.count for r in group)
+        written = 0
+        for rec in self._merge_iter([_vreader(r.fh, self.key_width)
+                                    for r in group]):
+            frame = self._frame(rec)
+            out.write(frame)
+            written += len(frame)
+        out.flush()
+        self.bytes_spilled += written
+        return _Run(count, out, name)
+
+    def _close_run(self, run: _Run) -> None:
+        try:
+            run.fh.close()
+        except OSError:
+            pass
+
+    def _close_runs(self) -> None:
+        for run in self._runs:
+            self._close_run(run)
+
+    def _unlink_dead(self, dead: List[_Run]) -> None:
+        live = {run.name for run in self._runs}
+        for run in dead:
+            if run.name in live:
+                continue
+            try:
+                os.unlink(run.name)
+            except OSError:
+                pass
+
+    def _unlink_runs(self) -> None:
+        seen = set()
+        for run in self._runs:
+            if run.name in seen:
+                continue
+            seen.add(run.name)
+            try:
+                os.unlink(run.name)
+            except OSError:
+                pass
+        self._runs = []
+
+    def close(self) -> None:
+        self._close_runs()
+        self._buf = []
+        for run in self._runs:
+            try:
+                os.unlink(run.name)
+            except OSError:
+                pass
+        self._runs = []
+
+
+def _vreader(fh: BinaryIO, key_width: int) -> Iterator[bytes]:
+    fh.seek(0)
+    while True:
+        hdr = fh.read(VariableExternalSorter._HDR)
+        if not hdr:
+            return
+        if len(hdr) != VariableExternalSorter._HDR:
+            raise ResourceError("temporary sort run is truncated")
+        length = int.from_bytes(hdr, "big")
+        body = fh.read(length)
+        if len(body) != length:
+            raise ResourceError("temporary sort run is truncated")
+        if len(body) < key_width:
+            raise ResourceError("temporary sort record is too short")
+        yield body

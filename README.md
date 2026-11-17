@@ -65,6 +65,155 @@ repository.
 
 ---
 
+# Valid-time (temporal) queries
+
+The static commands answer *whether* sources form a closed loop. The temporal
+commands additionally answer **when** the loop holds: the same query
+declaration describes the relations, aliases, variables and the global order,
+while the time axis lives in the data files of a separate directory — time is
+never an extra join variable.
+
+## Temporal data format
+
+Each line of a temporal `<relation>.jsonl` is one JSON object:
+
+```json
+{"values":[1,2],"since":0,"until":8,"copies":2}
+```
+
+* `values` correspond to the declaration's columns, signed `int64`, booleans
+  rejected;
+* `since`/`until` are signed `int64` ticks of the half-open interval
+  `[since, until)`, so `since < until` is required; there are no time zones
+  and no infinite endpoints;
+* `copies` is optional (default `1`), an arbitrary-precision **positive**
+  integer (`bool` is not accepted as an integer); the rows themselves are
+  never expanded into copies.
+
+At time *t* the multiplicity of one tuple is the sum of `copies` over every
+input row covering *t* (`since <= t < until`); overlapping and fully
+duplicate rows accumulate. A complete binding's multiplicity at *t* is the
+product of the per-atom tuple multiplicities — aliases each contribute their
+own factor, even when two aliases read the same physical tuple. Records whose
+interval never intersects the query window are valid data, not errors.
+
+## Temporal commands
+
+```bash
+python3 -m reljoin temporal-prepare --decl query.json --data tdata/ \
+                                    --index tidx --memory 32M
+python3 -m reljoin temporal-explain --decl query.json --index tidx
+python3 -m reljoin temporal-run     --decl query.json --index tidx \
+                                    --from 0 --to 10
+```
+
+`temporal-run` requires `--from L --to U` with `L < U`; the query covers only
+`[L, U)` and emits one object per positive-multiplicity, non-empty segment,
+ordered first by the global variable order and then by the segment start:
+
+```json
+{"values":[1,2,3],"since":2,"until":3,"multiplicity":24}
+```
+
+Adjacent segments of the **same binding** with the same multiplicity are
+merged into one maximal interval, even if several factors change on the same
+tick; holes and different bindings are never merged. Output is streamed, so a
+result larger than the memory budget never accumulates in the process.
+
+### Worked example (also asserted literally in the tests)
+
+```
+A(1,2): [0,8) copies 2, plus [3,6) copies 1
+B(2,3): [1,7) copies 3
+C(3,1): [2,5) copies 4, and [5,9) copies 4
+```
+
+Window `[0,10)` yields exactly `[2,3)·24`, `[3,6)·36`, `[6,7)·24` — there is
+no split at tick 5, because the two C rows meet there with equal copies and
+the multiplicity never changes. The exact integer weighted duration
+`sum((until-since)*multiplicity)` is `1·24 + 3·36 + 1·24 = 156`. Window
+`[4,8)` leaves `[4,6)·36` and `[6,7)·24`.
+
+### How the temporal engine works (and what it does not do)
+
+It does **not** re-run the static query once per integer tick, and it does
+**not** form the Cartesian product of the atoms' intervals.
+
+1. **Candidate phase** — the same layered leapfrog over ordered primary-key
+   seeks as the static engine finds each complete tuple binding exactly once.
+   Time is not part of the candidate intersection.
+2. **Time phase** — once a binding is complete, every alias opens a bounded
+   range cursor over its bound tuple's event rows (`tick < to`), and the
+   cursors are heap-merged in tick order. Each interval was stored at prepare
+   time as two events (`+copies` at `since`, `-copies` at `until`); the sweep
+   keeps one running multiplicity per alias, multiplies them, and emits a
+   segment only when the product changes. Same-tick events (including several
+   factors changing together) make one boundary.
+
+Both build and query accept `--memory`; the event sort spills to disk through
+a multi-pass external merge, and per-tuple trajectories larger than the budget
+are read in fixed-size fetch buffers. With input endpoints unchanged, growing
+the time span from 10 to 10¹⁵ does not change the number of events, boundary
+ticks or index accesses — the span itself is never enumerated.
+
+### Temporal index on disk
+
+```
+tidx/
+  manifest.json                  # reljoin-temporal-index-v1; written last
+  tables/<relation>.<digest>.db  # event table per distinct atom signature
+```
+
+Each table is a `WITHOUT ROWID` table keyed by the tuple columns in global
+order plus `tick`, carrying a variable-length signed delta BLOB (arbitrary
+precision, so multiplicities above 2⁶⁴ are exact). Builds are staged and
+renamed atomically: a failed build leaves no openable directory, and a failed
+`--force` rebuild keeps the previous index valid. After a successful build the
+original relation files can be removed; a fresh process answers from the
+index alone. Static and temporal indexes recognise each other's format and
+refuse to open with the wrong command (exit code 6) instead of returning empty
+results.
+
+### Temporal Python interface
+
+```python
+import reljoin
+
+decl = reljoin.load_declaration("query.json")
+idx  = reljoin.open_temporal_index("tidx", expected_declaration=decl)
+with reljoin.temporal_query(idx, decl, window=(0, 10)) as q:
+    for values, (since, until, multiplicity) in q:   # streamed segments
+        ...
+print(q.report())      # exact counters incl. weighted_duration (big integer)
+```
+
+`reljoin.temporal_query_segments(...)` yields `TemporalSegment(values, since,
+until, multiplicity)` objects, and `reljoin.temporal_explain(decl, idx)` /
+`reljoin.render_temporal_explain(doc)` give the structured and text plans.
+Closing early, cancellation and write failures mark the run `incomplete` and
+release every cursor and connection; only full exhaustion plus a successful
+consumer finish is reported `complete`.
+
+### Temporal statistics and exit codes
+
+The `--stats` document adds `window_from`/`window_to`, `event_rows_read`,
+`event_batches`, `sweep_boundaries`, `raw_segments_before_merge`,
+`segments_merged`, `emitted_segments`, `bindings_with_segments` and the exact
+integer `weighted_duration`. Exit codes are the same contract as the static
+commands (0 complete, 2 usage, 3 declaration, 4 data, 5 missing, 6 damaged or
+wrong-kind index, 7 incomplete, 8 resource).
+
+```bash
+python3 tests/reproduce_temporal.py --workdir /tmp/reljoin-tdemo
+```
+
+The temporal oracle (`tests/temporal_oracle.py`) reads only the raw interval
+files, collects endpoints, enumerates bag records in each adjacent gap and
+checks shared-variable equality — it never opens the index or the production
+executor.
+
+---
+
 ## Commands
 
 ### `prepare`

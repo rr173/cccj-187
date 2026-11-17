@@ -33,6 +33,12 @@ class CorruptIndex(IndexProblem):
     code = "index-corrupt"
 
 
+class WrongIndexKind(IndexProblem):
+    """A static index was opened as temporal (or vice versa)."""
+
+    code = "index-wrong-kind"
+
+
 class BuildIncomplete(ReljoinError):
     code = "build-incomplete"
 

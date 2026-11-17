@@ -18,13 +18,14 @@ from .declaration import (
     declaration_from_payload,
     fingerprint,
 )
-from .errors import CorruptIndex, IndexProblem, MissingIndex, ReljoinError
+from .errors import CorruptIndex, IndexProblem, MissingIndex, ReljoinError, WrongIndexKind
 from .index_build import (
     ATOMS_DIR,
     INDEX_FORMAT,
     INDEX_FORMAT_VERSION,
     MANIFEST,
 )
+from .temporal_format import TEMPORAL_INDEX_FORMAT
 
 MANIFEST_KEYS = {
     "format", "format_version", "declaration", "declaration_fingerprint",
@@ -262,6 +263,12 @@ def open_index(path: str, *, verify: bool = True, deep: bool = True,
         raise CorruptIndex(
             f"index manifest {mpath!r} is not valid JSON: {exc}"
         ) from exc
+    if isinstance(manifest, dict) and manifest.get("format") == TEMPORAL_INDEX_FORMAT:
+        raise WrongIndexKind(
+            f"{path!r} is a temporal (valid-time) index; use "
+            "'temporal-run'/'temporal-explain' for it, or build a static "
+            "index with 'prepare'"
+        )
     _check_manifest(manifest, mpath)
 
     decl = declaration_from_payload(manifest["declaration"], path=mpath,
