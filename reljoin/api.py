@@ -23,7 +23,9 @@ from typing import Any, Dict, Iterator, Optional, Tuple
 from .declaration import Declaration, declaration_from_payload, parse_declaration
 from .engine import Query, Stats, Solver
 from .errors import (
+    BatchConflict,
     CorruptIndex,
+    CorrectionProblem,
     DataProblem,
     DeclarationProblem,
     IndexProblem,
@@ -41,6 +43,20 @@ from .temporal_build import build_temporal_index
 from .temporal_engine import TemporalQuery, TemporalStats, check_window
 from .temporal_explain import render_temporal_explain, temporal_explain
 from .temporal_open import TemporalOpenIndex, open_temporal_index
+from .maintain_apply import (
+    ApplyResult,
+    MaintainReceipt,
+    apply_corrections,
+)
+from .maintain_explain import maintain_explain, render_maintain_explain
+from .maintain_init import init_maintenance
+from .maintain_query import (
+    MaintainQuery,
+    fetch_receipt,
+    list_batches,
+    stream_batch_delta,
+)
+from .maintain_store import MaintainStore, open_maintain_store
 
 __all__ = [
     "load_declaration",
@@ -74,6 +90,21 @@ __all__ = [
     "DataProblem",
     "ResourceError",
     "QueryAborted",
+    "CorrectionProblem",
+    "BatchConflict",
+    "init_maintenance",
+    "open_maintain_store",
+    "MaintainStore",
+    "MaintainQuery",
+    "MaintainReceipt",
+    "ApplyResult",
+    "apply_corrections",
+    "maintain_query_segments",
+    "stream_batch_delta",
+    "fetch_receipt",
+    "list_batches",
+    "maintain_explain",
+    "render_maintain_explain",
 ]
 
 
@@ -208,5 +239,45 @@ def temporal_query_segments(
     try:
         for values, (since, until, mult) in q:
             yield TemporalSegment(values, since, until, mult)
+    finally:
+        q.close()
+
+
+class MaintainSegment(Tuple[Tuple[int, ...], int, int, int]):
+    """``(values, since, until, multiplicity)`` from a maintained view."""
+
+    __slots__ = ()
+
+    def __new__(cls, values: Tuple[int, ...], since: int, until: int,
+                multiplicity: int) -> "MaintainSegment":
+        return super().__new__(cls, (values, since, until, multiplicity))
+
+    @property
+    def values(self) -> Tuple[int, ...]:
+        return self[0]
+
+    @property
+    def since(self) -> int:
+        return self[1]
+
+    @property
+    def until(self) -> int:
+        return self[2]
+
+    @property
+    def multiplicity(self) -> int:
+        return self[3]
+
+
+def maintain_query_segments(
+    store: MaintainStore,
+    decl: Optional[Declaration] = None,
+    **kwargs: Any,
+) -> Iterator[MaintainSegment]:
+    """Convenience generator yielding maintained view segments."""
+    q = MaintainQuery(store, decl, **kwargs)
+    try:
+        for values, (since, until, mult) in q:
+            yield MaintainSegment(values, since, until, mult)
     finally:
         q.close()

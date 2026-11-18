@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Optional
 
 from . import api
 from .errors import (
+    BatchConflict,
+    CorrectionProblem,
     CorruptIndex,
     DataProblem,
     DeclarationProblem,
@@ -37,6 +39,14 @@ from .explain import explain as explain_doc
 from .explain_text import render_explain
 from .index_build import build_index
 from .index_open import open_index
+from .maintain_apply import apply_corrections
+from .maintain_explain import maintain_explain, render_maintain_explain
+from .maintain_init import init_maintenance
+from .maintain_query import (
+    fetch_receipt,
+    stream_batch_delta,
+)
+from .maintain_store import open_maintain_store
 from .temporal_build import build_temporal_index
 from .temporal_engine import check_window
 from .temporal_explain import render_temporal_explain, temporal_explain
@@ -51,6 +61,7 @@ EXIT_CORRUPT_INDEX = 6
 EXIT_INCOMPLETE = 7
 EXIT_RESOURCE = 8
 EXIT_INTERNAL = 9
+EXIT_BATCH_CONFLICT = 10
 
 
 class _Cancelled(Exception):
@@ -60,11 +71,13 @@ class _Cancelled(Exception):
 def _exit_code_for(exc: BaseException) -> int:
     if isinstance(exc, QueryAborted):
         return EXIT_INCOMPLETE
+    if isinstance(exc, BatchConflict):
+        return EXIT_BATCH_CONFLICT
     if isinstance(exc, MissingIndex):
         return EXIT_MISSING_INDEX
     if isinstance(exc, CorruptIndex):
         return EXIT_CORRUPT_INDEX
-    if isinstance(exc, DataProblem):
+    if isinstance(exc, (DataProblem, CorrectionProblem)):
         return EXIT_DATA
     if isinstance(exc, DeclarationProblem):
         return EXIT_DECLARATION
@@ -563,6 +576,319 @@ def _emit_temporal_stats(args: argparse.Namespace, q) -> None:
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Maintenance (incremental correction) commands
+# --------------------------------------------------------------------------
+def cmd_maintain_init(args: argparse.Namespace) -> int:
+    decl = api.load_declaration(args.decl)
+    tidx = open_temporal_index(
+        args.index, expected_declaration=decl,
+        deep=not args.no_deep_verify,
+        progress=_progress_printer(args.verbose),
+    )
+    try:
+        manifest = init_maintenance(
+            decl, tidx, out_dir=args.maintain, memory_bytes=args.memory,
+            sort_dir=args.sort_dir, sqlite_cache_kib=args.sqlite_cache_kib,
+            force=args.force, progress=_progress_printer(args.verbose),
+        )
+    finally:
+        tidx.close()
+    if not args.quiet:
+        print(
+            f"initialised maintenance library {args.maintain} at revision 0 "
+            f"with {manifest['init']['report']['initial_view_segments']} "
+            "view segment(s); the temporal index and originals can now be "
+            "removed",
+            file=sys.stderr,
+        )
+    if args.json:
+        print(json.dumps(manifest, sort_keys=True, indent=2))
+    return EXIT_OK
+
+
+def _format_delta_row(row: Dict[str, Any]) -> bytes:
+    vals = ",".join(str(v) for v in row["values"])
+    return (
+        f'{{"values":[{vals}],"since":{row["since"]},"until":{row["until"]},'
+        f'"delta_multiplicity":{row["delta_multiplicity"]}}}\n'
+    ).encode("ascii")
+
+
+def _open_output(path: str):
+    if path == "-":
+        return sys.stdout.buffer, False
+    return open(path, "wb"), True
+
+
+def cmd_maintain_apply(args: argparse.Namespace) -> int:
+    decl = api.load_declaration(args.decl)
+    store = open_maintain_store(
+        args.maintain, expected_declaration=decl,
+        deep=not args.no_deep_verify,
+        progress=_progress_printer(args.verbose),
+    )
+    out = None
+    close_out = False
+    try:
+        result = apply_corrections(
+            store, batch_id=args.batch_id,
+            expect_revision=args.expect_revision,
+            correction_path=args.corrections, memory_bytes=args.memory,
+            sqlite_cache_kib=args.sqlite_cache_kib,
+            sort_dir=args.sort_dir,
+            kill_hook=args.kill_hook,
+            progress=_progress_printer(args.verbose),
+        )
+        receipt = result.receipt
+        # The commit is durable regardless of whether the export below
+        # succeeds.  The delta is re-read from the committed batch table (never
+        # re-applied), so a write failure cannot masquerade as a failed apply.
+        committed_note = None
+        try:
+            out, close_out = _open_output(args.out)
+            for row in stream_batch_delta(store, receipt.batch_id):
+                out.write(_format_delta_row(row))
+            if out is sys.stdout.buffer:
+                out.flush()
+            elif close_out:
+                out.close()
+        except OSError as exc:
+            committed_note = exc
+        if committed_note is not None:
+            _err(
+                f"batch {receipt.batch_id!r} is committed at revision "
+                f"{receipt.revision}, but exporting the delta to "
+                f"{args.out!r} failed: {committed_note}; the batch was NOT "
+                "re-applied — re-fetch it with 'maintain-export --batch-id "
+                f"{receipt.batch_id}'",
+                "incomplete",
+            )
+            if args.stats:
+                _write_stats_file(args, result, receipt, exported=False)
+            return EXIT_INCOMPLETE
+        if not args.quiet:
+            verb = "replayed" if receipt.replayed else "committed"
+            print(
+                f"{verb} batch {receipt.batch_id!r} at revision "
+                f"{receipt.revision}: {receipt.delta_rows} delta row(s), "
+                f"weighted change {receipt.weighted_change}",
+                file=sys.stderr,
+            )
+        if args.stats:
+            _write_stats_file(args, result, receipt, exported=True)
+        if args.json:
+            print(json.dumps(receipt.as_dict(), sort_keys=True))
+        return EXIT_OK
+    finally:
+        store.close()
+
+
+def _write_stats_file(args, result, receipt, *, exported: bool) -> None:
+    d = result.stats.as_dict()
+    # Group the exact counters into the audited run phases, so no full scan is
+    # hidden inside an opaque total.
+    report = {
+        "receipt": receipt.as_dict(),
+        "delta_exported": exported,
+        "run_report": {
+            "startup_verification": {
+                "status": d["status"],
+                "verify": d["verify"],
+            },
+            "correction_read": {
+                "correction_lines": d["correction_lines"],
+                "correction_records": d["correction_records"],
+                "raw_events_inserted": d["raw_events_inserted"],
+            },
+            "relation_and_event_access": {
+                "stage_tuples": d["stage_tuples"],
+                "stage_coalesced": d["stage_coalesced"],
+                "validation_rows_scanned": d["validation_rows_scanned"],
+                "negative_checks": d["negative_checks"],
+                "delta_events_read": d["delta_events_read"],
+                "relation_events_upserted": d["relation_events_upserted"],
+                "relation_events_deleted": d["relation_events_deleted"],
+            },
+            "candidate_dedup": {
+                "seed_tuples": d["seed_tuples"],
+                "discovery_seeks": d["discovery_seeks"],
+                "discovery_probes": d["discovery_probes"],
+                "bindings_discovered": d["bindings_discovered"],
+                "candidate_duplicates": d["candidate_duplicates"],
+                "binding_sweeps": d["binding_sweeps"],
+            },
+            "delta_output": {
+                "delta_boundaries": d["delta_boundaries"],
+                "delta_segments": d["delta_segments"],
+                "delta_rows_written": d["delta_rows_written"],
+            },
+            "view_write": {
+                "view_rows_deleted": d["view_rows_deleted"],
+                "view_rows_inserted": d["view_rows_inserted"],
+            },
+            "resources": {
+                "peak_rss_kib": d["peak_rss_kib"],
+                "elapsed_seconds": d["elapsed_seconds"],
+                "scratch_bytes": d["scratch_bytes"],
+                "spill_files": d["spill_files"],
+            },
+        },
+        "counters": d,
+    }
+    try:
+        with open(args.stats, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, sort_keys=True, indent=2)
+            fh.write("\n")
+    except OSError as exc:
+        print(f"reljoin: cannot write --stats file: {exc}", file=sys.stderr)
+
+
+def cmd_maintain_run(args: argparse.Namespace) -> int:
+    decl = api.load_declaration(args.decl)
+    lo = check_window(args.from_, "--from")
+    hi = check_window(args.to, "--to")
+    if lo >= hi:
+        raise ResourceError(
+            f"--from ({lo}) must be strictly less than --to ({hi})"
+        )
+    store = open_maintain_store(
+        args.maintain, expected_declaration=decl,
+        deep=not args.no_deep_verify,
+    )
+    q = None
+    out = None
+    close_out = False
+    try:
+        q = api.MaintainQuery(
+            store, decl, window=(lo, hi), memory_bytes=args.memory,
+            limit=args.limit,
+        )
+        out, close_out = _open_output(args.out)
+        try:
+            for values, (since, until, mult) in q:
+                line = _format_segment(values, since, until, mult)
+                out.write(line)
+                q.stats.output_bytes += len(line)
+                if (args.max_output_bytes is not None
+                        and q.stats.output_bytes > args.max_output_bytes):
+                    q.close()
+                    q.stats.status = "incomplete"
+                    q.stats.status_reason = "output budget exhausted"
+                    _emit_maintain_stats(args, q, revision=q.revision)
+                    return EXIT_INCOMPLETE
+        finally:
+            if out is sys.stdout.buffer:
+                try:
+                    out.flush()
+                except (BrokenPipeError, OSError):
+                    try:
+                        devnull = os.open(os.devnull, os.O_WRONLY)
+                        os.dup2(devnull, sys.stdout.fileno())
+                    except OSError:
+                        pass
+            elif close_out:
+                out.close()
+        revision = q.revision
+        q.close()
+        if not args.quiet:
+            print(
+                f"maintain-run read revision {revision} "
+                f"({q.stats.emitted_segments} segment(s)) from the committed "
+                "view; no relation recomputation was performed",
+                file=sys.stderr,
+            )
+        _emit_maintain_stats(args, q, revision=revision)
+        if q.stats.status == "complete":
+            return EXIT_OK
+        return EXIT_INCOMPLETE
+    except BrokenPipeError:
+        if q is not None:
+            q.close()
+        return EXIT_INCOMPLETE
+    finally:
+        # The query owns its own connection; closing it is idempotent.  The
+        # store connection list is no longer pooled, so closing the store only
+        # flips its own state and never breaks another reader.
+        if q is not None:
+            q.close()
+        store.close()
+
+
+def _emit_maintain_stats(args, q, *, revision: int) -> None:
+    if not args.stats and not args.stats_stdout:
+        return
+    report = q.report(include_layers=not args.no_layer_stats)
+    report["revision_read"] = revision
+    report["source"] = "committed view table (no join recomputation)"
+    if args.stats:
+        try:
+            with open(args.stats, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, sort_keys=True, indent=2)
+                fh.write("\n")
+        except OSError as exc:
+            print(f"reljoin: cannot write --stats file: {exc}", file=sys.stderr)
+    if args.stats_stdout:
+        print(json.dumps(report, sort_keys=True))
+
+
+def cmd_maintain_explain(args: argparse.Namespace) -> int:
+    decl = api.load_declaration(args.decl)
+    store = open_maintain_store(
+        args.maintain, expected_declaration=decl,
+        deep=not args.no_deep_verify,
+    )
+    try:
+        doc = maintain_explain(store, decl)
+        if args.json:
+            print(json.dumps(doc, sort_keys=True, indent=2))
+        else:
+            sys.stdout.write(render_maintain_explain(doc))
+        return EXIT_OK
+    finally:
+        store.close()
+
+
+def cmd_maintain_export(args: argparse.Namespace) -> int:
+    decl = api.load_declaration(args.decl)
+    store = open_maintain_store(
+        args.maintain, expected_declaration=decl,
+        deep=not args.no_deep_verify,
+    )
+    out = None
+    close_out = False
+    try:
+        receipt = fetch_receipt(store, args.batch_id)
+        out, close_out = _open_output(args.out)
+        try:
+            for row in stream_batch_delta(store, args.batch_id):
+                out.write(_format_delta_row(row))
+            if out is sys.stdout.buffer:
+                out.flush()
+            elif close_out:
+                out.close()
+        except OSError as exc:
+            _err(
+                f"export write failed for committed batch "
+                f"{args.batch_id!r}: {exc}; the stored delta is untouched and "
+                "can be re-fetched",
+                "incomplete",
+            )
+            return EXIT_INCOMPLETE
+        if not args.quiet:
+            print(
+                f"exported {receipt['delta_rows']} delta row(s) of batch "
+                f"{args.batch_id!r} (revision {receipt['revision']}, "
+                f"weighted change {receipt['weighted_change']})",
+                file=sys.stderr,
+            )
+        if args.json:
+            print(json.dumps(receipt, sort_keys=True))
+        return EXIT_OK
+    finally:
+        store.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="reljoin",
@@ -742,6 +1068,126 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--no-deep-verify", action="store_true")
     tr.add_argument("--verbose", action="store_true")
     tr.set_defaults(func=cmd_temporal_run)
+
+    # -- maintain-init ---------------------------------------------------
+    mi = sub.add_parser(
+        "maintain-init",
+        help="create an independent maintenance library from a temporal index",
+        description=(
+            "Copy the temporal index's relation state into a new self-"
+            "contained maintenance library and build the initial closed-loop "
+            "view (revision 0). Afterwards the temporal index and the original "
+            "files can be deleted."
+        ),
+    )
+    mi.add_argument("--decl", required=True, metavar="FILE")
+    mi.add_argument("--index", required=True, metavar="DIR",
+                    help="existing temporal index directory")
+    mi.add_argument("--maintain", required=True, metavar="DIR",
+                    help="maintenance library directory to create")
+    mi.add_argument("--memory", required=True, type=_parse_memory,
+                    metavar="SIZE")
+    mi.add_argument("--sort-dir", default=None, metavar="DIR")
+    mi.add_argument("--sqlite-cache-kib", type=int, default=None)
+    mi.add_argument("--force", action="store_true")
+    mi.add_argument("--json", action="store_true")
+    mi.add_argument("--verbose", action="store_true")
+    mi.add_argument("--quiet", action="store_true")
+    mi.add_argument("--no-deep-verify", action="store_true")
+    mi.set_defaults(func=cmd_maintain_init)
+
+    # -- maintain-apply --------------------------------------------------
+    ma = sub.add_parser(
+        "maintain-apply",
+        help="apply one correction batch and emit the signed result delta",
+        description=(
+            "Incrementally apply a UTF-8 JSONL correction batch. The relation "
+            "state, the closed-loop view, the signed delta and the batch "
+            "receipt commit atomically and revision increments by one. An "
+            "identical re-send (same batch id, bytes and expect-revision) "
+            "returns the original receipt without another revision."
+        ),
+    )
+    ma.add_argument("--decl", required=True, metavar="FILE")
+    ma.add_argument("--maintain", required=True, metavar="DIR")
+    ma.add_argument("--batch-id", required=True, metavar="ID")
+    ma.add_argument("--expect-revision", required=True, type=int, metavar="N")
+    ma.add_argument("--corrections", required=True, metavar="FILE",
+                    help="UTF-8 JSONL correction batch")
+    ma.add_argument("--memory", required=True, type=_parse_memory,
+                    metavar="SIZE")
+    ma.add_argument("--sqlite-cache-kib", type=int, default=None)
+    ma.add_argument("--sort-dir", default=None, metavar="DIR",
+                    help="directory for the disk-backed scratch database "
+                         "(default: system temp; never inside the library)")
+    ma.add_argument("--out", default="-", metavar="FILE",
+                    help="delta JSONL output (default: stdout)")
+    ma.add_argument("--stats", default=None, metavar="FILE")
+    ma.add_argument("--stats-stdout", action="store_true")
+    ma.add_argument("--no-layer-stats", action="store_true")
+    ma.add_argument("--no-deep-verify", action="store_true")
+    ma.add_argument("--kill-hook", default=None, choices=["before-commit"],
+                    help=argparse.SUPPRESS)
+    ma.add_argument("--json", action="store_true")
+    ma.add_argument("--verbose", action="store_true")
+    ma.add_argument("--quiet", action="store_true")
+    ma.set_defaults(func=cmd_maintain_apply)
+
+    # -- maintain-run ----------------------------------------------------
+    mr = sub.add_parser(
+        "maintain-run",
+        help="stream the committed closed-loop view at its revision",
+        description=(
+            "Read the currently committed view inside [--from, --to) and "
+            "report the revision it was read at. Only stored view rows are "
+            "read; the join is never recomputed from the relation state."
+        ),
+    )
+    mr.add_argument("--decl", required=True, metavar="FILE")
+    mr.add_argument("--maintain", required=True, metavar="DIR")
+    mr.add_argument("--from", dest="from_", required=True, type=int)
+    mr.add_argument("--to", dest="to", required=True, type=int)
+    mr.add_argument("--memory", type=_parse_memory, default=64 << 20,
+                    metavar="SIZE")
+    mr.add_argument("--out", default="-", metavar="FILE")
+    mr.add_argument("--limit", type=int, default=None)
+    mr.add_argument("--max-output-bytes", type=int, default=None)
+    mr.add_argument("--stats", default=None, metavar="FILE")
+    mr.add_argument("--stats-stdout", action="store_true")
+    mr.add_argument("--no-layer-stats", action="store_true")
+    mr.add_argument("--no-deep-verify", action="store_true")
+    mr.add_argument("--quiet", action="store_true")
+    mr.set_defaults(func=cmd_maintain_run)
+
+    # -- maintain-explain ------------------------------------------------
+    me = sub.add_parser(
+        "maintain-explain",
+        help="explain affected-scope discovery, delta synthesis and sync",
+    )
+    me.add_argument("--decl", required=True, metavar="FILE")
+    me.add_argument("--maintain", required=True, metavar="DIR")
+    me.add_argument("--json", action="store_true")
+    me.add_argument("--no-deep-verify", action="store_true")
+    me.set_defaults(func=cmd_maintain_explain)
+
+    # -- maintain-export -------------------------------------------------
+    mx = sub.add_parser(
+        "maintain-export",
+        help="stream a committed batch's signed delta by batch-id",
+        description=(
+            "Re-fetch the stored delta of an already committed batch without "
+            "re-applying anything. Used to recover a delivery whose export "
+            "failed after the commit."
+        ),
+    )
+    mx.add_argument("--decl", required=True, metavar="FILE")
+    mx.add_argument("--maintain", required=True, metavar="DIR")
+    mx.add_argument("--batch-id", required=True, metavar="ID")
+    mx.add_argument("--out", default="-", metavar="FILE")
+    mx.add_argument("--json", action="store_true")
+    mx.add_argument("--quiet", action="store_true")
+    mx.add_argument("--no-deep-verify", action="store_true")
+    mx.set_defaults(func=cmd_maintain_export)
 
     return p
 

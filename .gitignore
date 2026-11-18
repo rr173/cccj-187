@@ -3,3 +3,8 @@ __pycache__/
 /data/
 /index/
 /idx/
+/tidx/
+/mlib/
+*.db-wal
+*.db-shm
+.reljoin-tmp-*

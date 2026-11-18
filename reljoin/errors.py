@@ -53,3 +53,15 @@ class ResourceError(ReljoinError):
 
 class QueryAborted(ReljoinError):
     code = "query-aborted"
+
+
+class CorrectionProblem(ReljoinError):
+    """A correction batch is malformed or would leave a negative bag."""
+
+    code = "correction"
+
+
+class BatchConflict(ReljoinError):
+    """Optimistic revision mismatch or a reused batch-id with different data."""
+
+    code = "batch-conflict"

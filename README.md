@@ -214,6 +214,182 @@ executor.
 
 ---
 
+# Incremental maintenance (correction batches)
+
+Daily full rebuilds and full before/after query diffs do not scale once the
+maintained history is large.  The maintenance product applies a *correction
+batch* incrementally: only the tuples the batch names are read, only the
+closed-loop bindings those tuples can reach are recomputed, and everything
+else in the stored view is left byte-for-byte untouched.
+
+The new user operation is **apply a correction to maintained data**, not
+another kind of full query.  The old static and temporal entry points keep
+working unchanged.
+
+## Correction files
+
+A correction batch is a UTF-8 JSONL file; every non-blank line is exactly:
+
+```json
+{"relation": "A", "values": [1, 2], "since": 2, "until": 8, "delta": 1}
+```
+
+* `relation` must appear in the declaration and `values` must match its arity;
+  values and endpoints are signed `int64` (booleans are not integers);
+* `since < until` — intervals are half-open `[since, until)`;
+* `delta` is a **non-zero**, arbitrary-precision signed integer (the only
+  integer allowed to exceed 64 bits); it changes the relation's bag by that
+  many copies over the interval;
+* several lines may correct the same tuple on overlapping intervals; they are
+  summed first, so a legal batch is never rejected because an early line
+  temporarily dips a running total.  A batch is rejected as a whole if the
+  *final* multiplicity of any tuple is negative on any period, even for a tuple
+  that never participates in a closed loop.
+
+## Commands (from an empty directory)
+
+First build a temporal index exactly as above, then create the independent
+maintenance library:
+
+```bash
+python3 -m reljoin temporal-prepare --decl query.json --data data \
+    --index tidx --memory 32M
+python3 -m reljoin maintain-init --decl query.json --index tidx \
+    --maintain mlib --memory 32M
+# The temporal index and the original files can now be deleted.
+```
+
+`maintain-init` copies the relation state into a self-contained library
+(`manifest.json` + `state.db`), builds the initial closed-loop view and records
+**revision 0**.  Reopening the library never touches the source again.
+
+Apply a batch (optimistic revision check, one atomic commit):
+
+```bash
+cat > batch1.jsonl <<'JSONL'
+{"relation": "A", "values": [1, 2], "since": 2, "until": 8, "delta": 1}
+{"relation": "B", "values": [2, 3], "since": 4, "until": 6, "delta": -1}
+JSONL
+python3 -m reljoin maintain-apply --decl query.json --maintain mlib \
+    --batch-id b1 --expect-revision 0 --corrections batch1.jsonl \
+    --memory 32M --out b1.delta.jsonl --stats b1.stats.json
+```
+
+On success the relation state, the closed-loop view, the signed delta and the
+batch receipt commit together and revision increments by one (a net-zero but
+legal batch still increments).  The stdout/file delta is one object per row,
+ordered by the global variable binding and then the segment start:
+
+```json
+{"values":[1,2,3],"since":2,"until":4,"delta_multiplicity":12}
+{"values":[1,2,3],"since":6,"until":8,"delta_multiplicity":12}
+```
+
+`delta_multiplicity` is the signed new-minus-old multiplicity; zero rows are
+not emitted, and adjacent pieces with the same delta are merged into maximal
+segments rather than mechanically pairing old and new segments.  The receipt
+records the exact signed weighted change
+`sum((until-since)*delta_multiplicity)`.
+
+Read the currently committed view (no join recomputation — it reads the stored
+view table only) and the revision it was read at:
+
+```bash
+python3 -m reljoin maintain-run --decl query.json --maintain mlib \
+    --from 0 --to 10 --stats-stdout
+# stderr: maintain-run read revision 1 (N segment(s)) from the committed view
+```
+
+Re-fetch a committed batch's delta without re-applying it (used to recover a
+delivery whose export failed after the commit):
+
+```bash
+python3 -m reljoin maintain-export --decl query.json --maintain mlib \
+    --batch-id b1
+python3 -m reljoin maintain-explain --decl query.json --maintain mlib
+```
+
+Exit codes add `10` for a batch conflict; a correction data problem is `4`;
+an export that fails *after* a durable commit returns `7` and the stderr message
+names the committed revision and the `maintain-export --batch-id` recovery
+command — the batch is never re-applied and the revision is not claimed failed.
+
+## Idempotency and conflicts
+
+* **Re-send** — the same batch id with identical file bytes and the same
+  original `--expect-revision` returns the stored receipt and delta and does
+  **not** increment the revision, even if the current revision has moved.  The
+  idempotency check runs before the revision conflict check.
+* **Reused id, different content or expect-revision** — rejected with exit `10`.
+* **Stale expect-revision on a new batch id** — rejected with exit `10`; two
+  processes that submit the same expect-revision cannot both commit.
+
+## How the increment stays incremental
+
+`maintain-explain` prints the full plan; in summary:
+
+1. the JSONL batch is streamed into a disk-backed scratch database (a batch
+   larger than memory is never held in RAM, and the scratch lives in the temp
+   directory, never inside the library);
+2. per touched tuple the batch events are merge-joined with the tuple's current
+   events, proving the final per-period multiplicity is non-negative;
+3. each touched tuple seeds the layered leapfrog walk, clamped to its values;
+   bindings reachable through several changed atoms are deduplicated on disk,
+   so no binding is swept twice and no unrelated binding is visited;
+4. for each affected binding the old and post-batch event streams of every atom
+   are heap-merged — same-tick changes across atoms form one boundary, so the
+   product difference includes every cross term automatically, with each alias
+   contributing its own factor;
+5. relation state, view, delta and receipt change in one SQLite transaction.
+
+Readers open a read-only snapshot transaction and pin it for the whole stream,
+so a reader that has started (even one still draining its first rows) keeps
+seeing one revision while another process commits; a fresh reader sees the new
+revision.  A SIGKILL or rollback leaves relations, view and receipts together
+at the previous revision.
+
+## Python interface
+
+```python
+import reljoin
+
+store = reljoin.open_maintain_store("mlib")                 # verifies, deep
+result = reljoin.apply_corrections(
+    store, batch_id="b1", expect_revision=0,
+    correction_path="batch1.jsonl", memory_bytes=32 << 20,
+)
+print(result.receipt.revision, result.receipt.weighted_change)
+
+with reljoin.MaintainQuery(store, window=(0, 10)) as q:
+    revision = q.revision
+    for values, (since, until, multiplicity) in q:
+        ...
+for row in reljoin.stream_batch_delta(store, "b1"):         # item-by-item
+    ...
+print(reljoin.fetch_receipt(store, "b1"))
+```
+
+## Maintenance tests and data
+
+```bash
+python3 -m unittest tests.test_maintain_acceptance \
+    tests.test_maintain_lifecycle tests.test_maintain_scale
+python3 tests/reproduce_maintain.py --workdir /tmp/reljoin-mdemo
+```
+
+`tests/maintain_oracle.py` rebuilds the relation bags from the raw interval and
+correction files and enumerates every binding from scratch between endpoints;
+it never opens the maintenance database or a production cursor.  The lifecycle
+tests use real subprocesses (a pinned-revision reader vs. a concurrent writer,
+same-revision writer races with exit `10`, a SIGKILL with exit `-9` and an
+export write failure that keeps the committed receipt).  The scale tests
+generate many unrelated loops and confirm a one-tuple correction visits one
+loop, plus a fragmented batch that spills under a tight memory budget while RSS
+stays bounded.
+
+
+---
+
 ## Commands
 
 ### `prepare`
